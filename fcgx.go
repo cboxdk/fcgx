@@ -150,9 +150,6 @@ const (
 	fcgiResponder       = 1 // Responder role (handles HTTP requests)
 	fcgiRequestComplete = 0 // Request completed successfully
 
-	// Performance and protocol limits
-	maxWrite = 65500 // Maximum write chunk size (slightly under 64KB for safety)
-	maxPad   = 255   // Maximum padding length
 )
 
 // header represents a FastCGI record header as defined in the FastCGI specification
@@ -279,7 +276,7 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 			})
 		}
 		// Reset deadline after request
-		defer c.conn.SetDeadline(time.Time{})
+		defer func() { _ = c.conn.SetDeadline(time.Time{}) }()
 	}
 
 	// BEGIN_REQUEST record
@@ -534,7 +531,7 @@ func (c *Client) Post(ctx context.Context, params map[string]string, body io.Rea
 	// If body is a string reader, ensure it's properly formatted
 	if sr, ok := body.(*strings.Reader); ok {
 		buf := make([]byte, sr.Len())
-		sr.Read(buf)
+		_, _ = sr.Read(buf)
 		body = bytes.NewReader(buf)
 	}
 

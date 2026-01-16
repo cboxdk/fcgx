@@ -1,3 +1,9 @@
+---
+title: "Protocol Notes"
+description: "Technical reference for the FastCGI protocol specification and implementation details"
+weight: 95
+---
+
 # FastCGI Protocol Notes
 
 ## Overview
