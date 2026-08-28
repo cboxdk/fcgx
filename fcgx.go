@@ -71,6 +71,13 @@ var (
 	ErrConnect          = errors.New("fcgx: connect error")
 	ErrWrite            = errors.New("fcgx: write error")
 	ErrRead             = errors.New("fcgx: read error")
+
+	// ErrResponseTooLarge reports a response that exceeded Config.MaxResponseSize.
+	//
+	// Returned rather than truncated: a partial FastCGI response is not a smaller
+	// valid response, it is a broken one, and a caller decoding JSON from it would
+	// get a parse error naming the wrong problem.
+	ErrResponseTooLarge = errors.New("fcgx: response exceeds the configured maximum size")
 )
 
 // Config holds configuration options for FastCGI client behavior.
@@ -87,14 +94,27 @@ type Config struct {
 	// RequestTimeout sets a default timeout for requests when context has no deadline.
 	// Default: 30 seconds
 	RequestTimeout time.Duration
+
+	// MaxResponseSize bounds how much of a response is accumulated in memory.
+	//
+	// A FastCGI response arrives as a series of records, each at most 64KB, and
+	// there is no limit on how many the server may send. Without a ceiling, a
+	// broken or hostile endpoint can make a long-running client allocate until it
+	// dies — and the client cannot tell the difference between that and a large
+	// legitimate page, because the size is not announced up front.
+	//
+	// Default: 16MiB, which is far above any status or API response and far below
+	// anything that threatens a process.
+	MaxResponseSize int
 }
 
 // DefaultConfig returns a Config with sensible defaults for most use cases
 func DefaultConfig() *Config {
 	return &Config{
-		MaxWriteSize:   65500,
-		ConnectTimeout: 5 * time.Second,
-		RequestTimeout: 30 * time.Second,
+		MaxWriteSize:    65500,
+		ConnectTimeout:  5 * time.Second,
+		RequestTimeout:  30 * time.Second,
+		MaxResponseSize: 16 << 20,
 	}
 }
 
@@ -343,7 +363,14 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 	// Read response - use buffer pool for better memory management
 	respBuf := bufferPool.Get().(*bytes.Buffer)
 	respBuf.Reset()
-	defer bufferPool.Put(respBuf)
+	defer func() {
+		// A buffer that grew large is not returned to the pool. sync.Pool keeps
+		// what it is given alive for the life of the process, so one big response
+		// would otherwise cost that memory permanently.
+		if respBuf.Cap() <= 1<<20 {
+			bufferPool.Put(respBuf)
+		}
+	}()
 	endRequestReceived := false
 
 	for {
@@ -367,6 +394,17 @@ func (c *Client) DoRequest(ctx context.Context, params map[string]string, body i
 		}
 
 		if h.Type == fcgiStdout || h.Type == fcgiStderr {
+			// Checked BEFORE the read, so an oversized response costs one record
+			// rather than another allocation on top of an already-full buffer.
+			if max := c.config.MaxResponseSize; max > 0 &&
+				respBuf.Len()+int(h.ContentLength) > max {
+				return nil, wrapWithContext(ErrResponseTooLarge, ErrResponseTooLarge,
+					"reading response body", map[string]interface{}{
+						"max_response_size": max,
+						"received":          respBuf.Len(),
+					})
+			}
+
 			b := make([]byte, h.ContentLength)
 			if _, err := io.ReadFull(c.conn, b); err != nil {
 				if isTimeout(err) {

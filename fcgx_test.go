@@ -3,6 +3,7 @@ package fcgx
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -416,4 +417,89 @@ func TestFCGXIntegration(t *testing.T) {
 			}
 		})
 	})
+}
+
+// TestResponseSizeIsBounded.
+//
+// A FastCGI response arrives as a series of records, each at most 64KB, with no
+// limit on how many the server may send and no size announced up front. Without
+// a ceiling a broken or hostile endpoint makes a long-running client allocate
+// until it dies — and a client scraping a status endpoint every few seconds is
+// exactly the shape of program that cannot afford that.
+func TestResponseSizeIsBounded(t *testing.T) {
+	client, server := net.Pipe()
+
+	go func() {
+		defer server.Close()
+
+		// Read whatever the client sends, then flood it with STDOUT records.
+		go func() { _, _ = io.Copy(io.Discard, server) }()
+
+		payload := make([]byte, 60000)
+		for range 200 { // ~12MB against a 1MB cap
+			h := header{Version: 1, Type: fcgiStdout, RequestID: 1, ContentLength: uint16(len(payload))}
+			if err := binary.Write(server, binary.BigEndian, &h); err != nil {
+				return
+			}
+			if _, err := server.Write(payload); err != nil {
+				return
+			}
+		}
+	}()
+
+	c := &Client{conn: client, reqID: 1, config: &Config{
+		MaxWriteSize:    65500,
+		MaxResponseSize: 1 << 20,
+	}}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := c.Get(ctx, map[string]string{"SCRIPT_FILENAME": "/status"})
+	if !errors.Is(err, ErrResponseTooLarge) {
+		t.Fatalf("err = %v, want ErrResponseTooLarge: an unbounded response was accepted", err)
+	}
+}
+
+// TestAResponseUnderTheCapIsStillRead: the bound must not break ordinary
+// responses, which is the only thing it could plausibly cost.
+func TestAResponseUnderTheCapIsStillRead(t *testing.T) {
+	client, server := net.Pipe()
+
+	body := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"pool\":\"www\"}"
+
+	go func() {
+		defer server.Close()
+		go func() { _, _ = io.Copy(io.Discard, server) }()
+
+		h := header{Version: 1, Type: fcgiStdout, RequestID: 1, ContentLength: uint16(len(body))}
+		if err := binary.Write(server, binary.BigEndian, &h); err != nil {
+			return
+		}
+		if _, err := server.Write([]byte(body)); err != nil {
+			return
+		}
+
+		end := header{Version: 1, Type: fcgiEndRequest, RequestID: 1}
+		_ = binary.Write(server, binary.BigEndian, &end)
+	}()
+
+	c := &Client{conn: client, reqID: 1, config: DefaultConfig()}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.Get(ctx, map[string]string{"SCRIPT_FILENAME": "/status"})
+	if err != nil {
+		t.Fatalf("an ordinary response was refused: %v", err)
+	}
+	got, err := ReadBody(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != `{"pool":"www"}` {
+		t.Errorf("body = %q", got)
+	}
 }
